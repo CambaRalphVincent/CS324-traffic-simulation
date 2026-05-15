@@ -365,5 +365,5 @@ Low Traffic reaches a stable steady state, so its metrics are well-defined. **No
 
 ---
 
-*Generated for CS 324 Modeling and Simulation — Final Project*
+*CS 324 Modeling and Simulation — Final Project*
 *Batangas State University, AY 2025–2026*
