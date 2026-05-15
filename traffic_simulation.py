@@ -25,6 +25,8 @@ import math
 import random
 import csv
 import os
+import argparse
+import statistics
 from collections import deque
 from datetime import datetime
 
@@ -362,7 +364,7 @@ class Vehicle:
             at_head = (queue[0] is self) if queue else False
             gap = self.env.now - self.intersection.last_depart[self.direction]
             if (light == 'green' and at_head and gap >= DEPART_HEADWAY
-                    and self.at_slot):
+                    and (self.at_slot or self.intersection.headless)):
                 break
             yield self.env.timeout(0.1)
             if self in queue:
@@ -463,8 +465,12 @@ class Pedestrian:
 
 class Intersection:
     """Holds queues, controller, statistics."""
-    def __init__(self, env, control_mode='fixed', scenario='Normal Traffic'):
+    def __init__(self, env, control_mode='fixed', scenario='Normal Traffic',
+                 headless=False):
         self.env = env
+        # Headless (batch) runs have no renderer to drive at_slot, so the
+        # visual "car has reached the stop line" gate is treated as satisfied.
+        self.headless = headless
         self.scenario = scenario
         self.queues = {d: deque() for d in DIRECTIONS}
         self.completed = []
@@ -1564,5 +1570,197 @@ class App:
         pygame.quit()
 
 
+# =====================================================================
+# HEADLESS BATCH EXPERIMENT RUNNER
+# Runs the simulation with no rendering, across replications, with a
+# warm-up cutoff and 95% confidence intervals — for defensible results.
+# =====================================================================
+
+# Two-sided t critical values at 95% confidence, by degrees of freedom.
+# df > 30 falls back to the normal approximation (1.96).
+_T95 = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+    7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179,
+    13: 2.160, 14: 2.145, 15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101,
+    19: 2.093, 20: 2.086, 21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064,
+    25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+}
+
+
+def _t_critical(df):
+    if df <= 0:
+        return 0.0
+    return _T95.get(df, 1.96)
+
+
+def _steady_state_metrics(inter, warmup, duration):
+    """Performance metrics over the steady-state window only — vehicles that
+    completed before `warmup` are discarded to remove the initial transient.
+    """
+    window = max(duration - warmup, 1e-9)
+    rec = [v for v in inter.completed
+           if v.finish_time is not None and v.finish_time >= warmup]
+    n = len(rec)
+    if n == 0:
+        return {'avg_wait': 0.0, 'max_wait': 0.0, 'throughput': 0.0,
+                'efficiency': 0.0, 'completed': 0}
+    waits = [v.wait_time() for v in rec]
+    avg_wait = sum(waits) / n
+    max_wait = max(waits)
+    throughput = n / window * 60.0          # vehicles per minute
+    efficiency = throughput / avg_wait if avg_wait > 0 else throughput
+    return {'avg_wait': avg_wait, 'max_wait': max_wait,
+            'throughput': throughput, 'efficiency': efficiency,
+            'completed': n}
+
+
+def run_one(scenario, mode, duration, warmup, seed):
+    """One headless replication. Returns its steady-state metrics."""
+    random.seed(seed)
+    Vehicle._id_counter = 0
+    Pedestrian._id_counter = 0
+    env = simpy.Environment()
+    inter = Intersection(env, control_mode=mode, scenario=scenario,
+                         headless=True)
+    env.run(until=duration)
+    return _steady_state_metrics(inter, warmup, duration)
+
+
+_METRICS = [
+    ('avg_wait',   'Avg Wait (s)',        's'),
+    ('max_wait',   'Max Wait (s)',        's'),
+    ('throughput', 'Throughput (cars/min)', '/min'),
+    ('efficiency', 'Efficiency',          ''),
+]
+
+
+def run_batch(scenarios, modes, reps, duration, warmup, base_seed, out_dir):
+    """Run every scenario x mode for `reps` replications, then report the
+    mean and 95% confidence interval of each metric, and write raw +
+    summary CSVs for the report.
+    """
+    if duration <= warmup:
+        raise SystemExit(f"--duration ({duration}) must exceed --warmup ({warmup}).")
+
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rep_path = os.path.join(out_dir, f"batch_replications_{ts}.csv")
+    sum_path = os.path.join(out_dir, f"batch_summary_{ts}.csv")
+
+    print(f"\nHeadless batch: {reps} reps x {duration:.0f}s "
+          f"(warm-up {warmup:.0f}s discarded), base seed {base_seed}\n")
+
+    sum_header = ['scenario', 'mode']
+    for _, label, _ in _METRICS:
+        sum_header += [f"{label} mean", f"{label} stdev",
+                       f"{label} ci95_halfwidth"]
+
+    interrupted = False
+    # Both files are opened up front and flushed after every replication /
+    # summary row, so a long run can be safely Ctrl+C'd at any time and
+    # whatever finished is already on disk.
+    with open(rep_path, 'w', newline='') as rf, \
+            open(sum_path, 'w', newline='') as sf:
+        rw = csv.writer(rf)
+        sw = csv.writer(sf)
+        rw.writerow(['scenario', 'mode', 'replication',
+                     'avg_wait', 'max_wait', 'throughput', 'efficiency',
+                     'completed'])
+        rf.flush()
+        sw.writerow(sum_header)
+        sf.flush()
+
+        try:
+            for scenario in scenarios:
+                for mode in modes:
+                    print(f"  {scenario:<14} {mode:<8}  (n={reps})",
+                          flush=True)
+                    samples = {k: [] for k, _, _ in _METRICS}
+                    for r in range(reps):
+                        m = run_one(scenario, mode, duration, warmup,
+                                    base_seed + r)
+                        for k, _, _ in _METRICS:
+                            samples[k].append(m[k])
+                        rw.writerow(
+                            [scenario, mode, r + 1,
+                             f"{m['avg_wait']:.4f}", f"{m['max_wait']:.4f}",
+                             f"{m['throughput']:.4f}",
+                             f"{m['efficiency']:.4f}", m['completed']])
+                        rf.flush()
+                        print(f"\r      replication {r + 1}/{reps} done",
+                              end='', flush=True)
+                    print()  # end the progress line
+
+                    summary = {}
+                    for k, label, _ in _METRICS:
+                        xs = samples[k]
+                        mean = statistics.mean(xs)
+                        if len(xs) >= 2:
+                            sd = statistics.stdev(xs)
+                            hw = (_t_critical(len(xs) - 1) * sd
+                                  / math.sqrt(len(xs)))
+                        else:
+                            sd, hw = 0.0, 0.0
+                        summary[k] = (mean, sd, hw)
+                        print(f"      {label:<22} {mean:8.3f}  "
+                              f"+/- {hw:6.3f}  (95% CI)")
+                    row = [scenario, mode]
+                    for k, _, _ in _METRICS:
+                        mean, sd, hw = summary[k]
+                        row += [f"{mean:.4f}", f"{sd:.4f}", f"{hw:.4f}"]
+                    sw.writerow(row)
+                    sf.flush()
+                    print()
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n\n[Interrupted] Stopping early. Every scenario/mode "
+                  "that finished is already saved below.")
+
+    status = "[Partial]" if interrupted else "[Saved]"
+    print(f"{status} {rep_path}")
+    print(f"{status} {sum_path}")
+
+
+def _parse_filter(value, allowed):
+    if value == 'all':
+        return list(allowed)
+    picked = [v.strip() for v in value.split(',') if v.strip()]
+    bad = [v for v in picked if v not in allowed]
+    if bad:
+        raise SystemExit(f"Unknown value(s) {bad}. Allowed: {list(allowed)}")
+    return picked
+
+
 if __name__ == '__main__':
-    App().run()
+    parser = argparse.ArgumentParser(
+        description="Traffic Light Simulation — GUI by default, or a "
+                    "headless batch experiment with --batch.")
+    parser.add_argument('--batch', action='store_true',
+                        help="Run headless replicated experiments instead "
+                             "of the GUI.")
+    parser.add_argument('--reps', type=int, default=10,
+                        help="Replications per scenario/mode (default 10).")
+    parser.add_argument('--duration', type=float, default=1800.0,
+                        help="Simulated seconds per replication (default 1800).")
+    parser.add_argument('--warmup', type=float, default=300.0,
+                        help="Initial sim-seconds discarded as transient "
+                             "(default 300).")
+    parser.add_argument('--seed', type=int, default=12345,
+                        help="Base RNG seed; replication r uses seed+r.")
+    parser.add_argument('--out', default='results',
+                        help="Output directory for CSVs (default 'results').")
+    parser.add_argument('--scenarios', default='all',
+                        help="Comma list or 'all' (Low Traffic, "
+                             "Normal Traffic, Rush Hour).")
+    parser.add_argument('--modes', default='all',
+                        help="Comma list or 'all' (fixed, adaptive).")
+    args = parser.parse_args()
+
+    if args.batch:
+        run_batch(
+            _parse_filter(args.scenarios, list(SCENARIOS.keys())),
+            _parse_filter(args.modes, ['fixed', 'adaptive']),
+            args.reps, args.duration, args.warmup, args.seed, args.out,
+        )
+    else:
+        App().run()

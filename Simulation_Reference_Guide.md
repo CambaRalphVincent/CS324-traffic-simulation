@@ -306,5 +306,64 @@ When analyzing simulation output, consider these patterns:
 
 ---
 
+## 9. Experimental Methodology — Headless Batch Mode
+
+The on-screen simulation is for demonstration. For **results reported in the project paper**, the simulation is run in *headless batch mode*, which applies three standard discrete-event-simulation practices so the numbers are statistically defensible rather than a single observed run.
+
+### 9.1 Why a single run is not enough
+
+Vehicle (and pedestrian) arrivals are random (Poisson, see §5). Running one scenario once gives **one sample** — run it again with different randomness and the numbers change. Reporting a single run is not defensible. Batch mode addresses this with replications, warm-up removal, and confidence intervals.
+
+### 9.2 Running it
+
+```
+python traffic_simulation.py --batch
+```
+
+This runs every scenario × every mode with no graphics and writes the results as CSV files. The normal command (`python traffic_simulation.py`, no flag) still launches the visual simulation, unchanged. Options:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--reps` | 10 | Independent replications per scenario/mode |
+| `--duration` | 1800 | Simulated seconds per replication |
+| `--warmup` | 300 | Initial sim-seconds discarded as transient |
+| `--seed` | 12345 | Base RNG seed |
+| `--scenarios` | all | Comma list or `all` |
+| `--modes` | all | Comma list or `all` (fixed, adaptive) |
+| `--out` | results | Output folder for the CSVs |
+
+### 9.3 Replications
+
+Each scenario/mode is run `--reps` times. Replication *r* uses seed `base_seed + r`, so every run is **independent** but the whole experiment is **exactly reproducible** (re-running with the same seed reproduces the same results — a requirement for a credible report).
+
+### 9.4 Warm-up period removal
+
+When the simulation starts, the intersection is empty — no queues. That startup is not representative of steady operation, so any vehicle that **finishes before `--warmup` sim-seconds** is discarded. All reported metrics are computed only over the steady-state window `[warmup, duration]`. This is the standard remedy for *initialisation bias* in discrete-event simulation.
+
+### 9.5 Confidence intervals (95%)
+
+For each metric, batch mode reports the **mean across replications** and a **95% confidence interval** using the Student's *t* distribution:
+
+> half-width = t₀.₉₇₅(df = R − 1) × (sample standard deviation) ÷ √R
+
+reported as **mean ± half-width**. Interpretation: *"we are 95% confident the true value lies within this range."* A smaller interval = more reliable; widen `--reps` to tighten it. (For more than 30 replications the normal approximation 1.96 is used.)
+
+**Stating a result as significant — the overlap check:** if the ± ranges of two modes **do not overlap**, the difference is statistically significant and can be stated as a firm conclusion. If they **overlap**, the difference is not conclusive from this evidence alone and should be reported as such.
+
+### 9.6 Output files
+
+Two timestamped CSVs are written to the output folder (and saved incrementally, so a long run can be safely interrupted with Ctrl+C and keep whatever finished):
+
+- **`batch_summary_<timestamp>.csv`** — one row per scenario/mode, with `mean`, `stdev`, and `ci95_halfwidth` for each metric. This is the table to put in the report.
+- **`batch_replications_<timestamp>.csv`** — one row per individual run (`scenario, mode, replication, avg_wait, max_wait, throughput, efficiency, completed`). This is the raw evidence for an appendix; `completed` is the number of vehicles counted in the steady-state window.
+
+Metrics use the definitions in §2. Note **Avg Wait** is still queue wait (start-cross − arrival, §2.4); throughput here is the steady-state rate over `[warmup, duration]`.
+
+### 9.7 Caveat: oversaturation and non-stationarity
+
+Low Traffic reaches a stable steady state, so its metrics are well-defined. **Normal Traffic and Rush Hour are oversaturated** — vehicles arrive faster than the intersection can discharge, so the queue never stabilises: average wait keeps growing the longer the run, while throughput plateaus at the intersection's capacity. For these scenarios, always report results **at a fixed, stated `--duration`** and explicitly note the system is non-stationary. This stable-vs-oversaturated contrast is itself a key analytical finding.
+
+---
+
 *Generated for CS 324 Modeling and Simulation — Final Project*
 *Batangas State University, AY 2025–2026*

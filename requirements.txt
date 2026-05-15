@@ -1,0 +1,6 @@
+# Python dependencies for the Traffic Light System Simulation.
+# Install with:  pip install -r requirements.txt
+# Tested with Python 3.13 on the versions below.
+
+simpy>=4.1.1
+pygame>=2.6.1
