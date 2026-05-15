@@ -21,6 +21,7 @@ Controls (in window):
 
 import simpy
 import pygame
+import math
 import random
 import csv
 import os
@@ -74,12 +75,22 @@ ADAPTIVE_QUEUE_THRESHOLD = 2  # extend green if queue still long
 # Vehicle behavior
 CAR_LENGTH = 55
 CAR_WIDTH = 38
-CAR_SPACING = 8  # gap between queued cars
+CAR_SPACING = 14  # gap between queued cars (larger = visibly safer following distance)
 CAR_SPEED = 60   # pixels per simulated second when moving
 CROSS_TIME = 2.5        # seconds for a car to clear the intersection box
 APPROACH_ANIM_TIME = 1.5  # sim seconds to slide in from the road edge
 EXIT_SPEED = 130          # px/sim-second for post-intersection travel to screen edge
 DEPART_HEADWAY = 2.0      # min sim-seconds between consecutive departures from same approach
+
+# Physics for realistic motion (smooths logical position into natural acceleration)
+CAR_ACCEL              = 110.0   # px/sec² normal acceleration
+CAR_DECEL              = 220.0   # px/sec² maximum braking
+CAR_QUEUE_MAX_SPEED    = 110.0   # max speed approaching / in queue area
+CAR_CROSS_MAX_SPEED    = 150.0   # max speed crossing the intersection
+CAR_EXIT_MAX_SPEED     = 180.0   # max speed leaving the intersection
+HEADING_TURN_RATE      = 320.0   # deg/sec — max rotation speed
+BRAKE_DECEL_THRESHOLD  = 45.0    # px/sec² braking magnitude → brake lights on
+SPEED_VARIANCE         = 0.18    # ±18% per-car speed factor (driver variance)
 
 # Scenarios: arrival rate per direction (vehicles/sec)
 SCENARIOS = {
@@ -295,6 +306,19 @@ class Vehicle:
         self.state = 'queued'
         self.cross_progress = 0.0   # 0→1 while crossing intersection box
         self.exit_progress = 0.0    # 0→1 while travelling to screen edge
+        # Rendered physics state — smoothly tracks the logical position above.
+        # None until the renderer first positions the vehicle.
+        self.disp_x       = None
+        self.disp_y       = None
+        self.disp_vel     = 0.0     # current motion speed (px/sec)
+        self.disp_heading = None    # current rendered angle
+        self.braking      = False   # brake lights on?
+        # True once the rendered car has physically reached its queue slot.
+        # Departure (queued → crossing) is gated on this so a car never starts
+        # crossing while still displayed far back on the approach road.
+        self.at_slot      = False
+        # Per-car driver variance: some cars are slightly faster/slower
+        self.speed_factor = random.uniform(1.0 - SPEED_VARIANCE, 1.0 + SPEED_VARIANCE)
         self.process = env.process(self.run())
 
     def wait_time(self):
@@ -308,12 +332,16 @@ class Vehicle:
         queue.append(self)
         self.queue_index = len(queue) - 1
 
-        # Wait until: green AND head of queue AND minimum headway since last departure
+        # Wait until: green AND head of queue AND min headway AND the rendered
+        # car has physically driven up to the stop line (self.at_slot). Gating
+        # on at_slot keeps the displayed car from ever starting a turn while
+        # it is still shown far back on the approach road.
         while True:
             light = self.intersection.controller.state_for(self.direction)
             at_head = (queue[0] is self) if queue else False
             gap = self.env.now - self.intersection.last_depart[self.direction]
-            if light == 'green' and at_head and gap >= DEPART_HEADWAY:
+            if (light == 'green' and at_head and gap >= DEPART_HEADWAY
+                    and self.at_slot):
                 break
             yield self.env.timeout(0.1)
             if self in queue:
@@ -536,8 +564,9 @@ class Renderer:
     def _crossing_path(self, direction, turn):
         """
         Returns (start, pivot, end, angle_start, angle_end) for a crossing vehicle.
-        pivot is None for straight (simple lerp); otherwise a two-segment path is used.
-        All positions are in the correct exit lane for right-hand traffic.
+        pivot is None for straight; otherwise it is the Bezier control point chosen
+        so the curve is tangent to the entry lane at `start` and tangent to the exit
+        lane at `end`. This means the car only changes heading inside the intersection.
         """
         cx, cy = self.cx, self.cy
         LN = LANE_WIDTH // 2   # 50 — half-lane offset from road centre
@@ -548,84 +577,232 @@ class Renderer:
             s, a0 = (cx - LN, cy - RW), 0
             if turn == 'straight':
                 return s, None,               (cx - LN, cy + RW + EXT), a0, 0
-            elif turn == 'right':             # → west; westbound = north lane (cy-LN)
+            elif turn == 'right':             # → west; tight inside corner
                 return s, (cx - LN, cy - LN), (cx - RW - EXT, cy - LN), a0, 270
-            else:                             # left → east; eastbound = south lane (cy+LN)
-                return s, (cx,      cy),      (cx + RW + EXT, cy + LN), a0, 90
+            else:                             # left → east; wide outside corner
+                return s, (cx - LN, cy + LN), (cx + RW + EXT, cy + LN), a0, 90
 
         elif direction == 'S':         # RHT: east lane (cx+LN) going north
             s, a0 = (cx + LN, cy + RW), 180
             if turn == 'straight':
                 return s, None,               (cx + LN, cy - RW - EXT), a0, 180
-            elif turn == 'right':             # → east; eastbound = south lane (cy+LN)
+            elif turn == 'right':             # → east; tight inside corner
                 return s, (cx + LN, cy + LN), (cx + RW + EXT, cy + LN), a0, 90
-            else:                             # left → west; westbound = north lane (cy-LN)
-                return s, (cx,      cy),      (cx - RW - EXT, cy - LN), a0, 270
+            else:                             # left → west; wide outside corner
+                return s, (cx + LN, cy - LN), (cx - RW - EXT, cy - LN), a0, 270
 
         elif direction == 'E':         # RHT: north lane (cy-LN) going west
             s, a0 = (cx + RW, cy - LN), 270
             if turn == 'straight':
                 return s, None,               (cx - RW - EXT, cy - LN), a0, 270
-            elif turn == 'right':             # → north; northbound = east lane (cx+LN)
+            elif turn == 'right':             # → north; tight inside corner
                 return s, (cx + LN, cy - LN), (cx + LN, cy - RW - EXT), a0, 180
-            else:                             # left → south; southbound = west lane (cx-LN)
-                return s, (cx,      cy),      (cx - LN, cy + RW + EXT), a0, 0
+            else:                             # left → south; wide outside corner
+                return s, (cx - LN, cy - LN), (cx - LN, cy + RW + EXT), a0, 0
 
         else:                          # W — RHT: south lane (cy+LN) going east
             s, a0 = (cx - RW, cy + LN), 90
             if turn == 'straight':
                 return s, None,               (cx + RW + EXT, cy + LN), a0, 90
-            elif turn == 'right':             # → south; southbound = west lane (cx-LN)
+            elif turn == 'right':             # → south; tight inside corner
                 return s, (cx - LN, cy + LN), (cx - LN, cy + RW + EXT), a0, 0
-            else:                             # left → north; northbound = east lane (cx+LN)
-                return s, (cx,      cy),      (cx + LN, cy - RW - EXT), a0, 180
+            else:                             # left → north; wide outside corner
+                return s, (cx + LN, cy + LN), (cx + LN, cy - RW - EXT), a0, 180
 
     def car_position(self, vehicle):
-        """Compute the (x, y, angle) of a vehicle on screen."""
+        """Logical target (x, y, angle) where the vehicle SHOULD be right now.
+        The physics update layer (update_motion) smoothly moves the displayed
+        position toward this target with realistic acceleration and braking.
+        """
         cx, cy = self.cx, self.cy
         d = vehicle.direction
         if vehicle.state == 'queued':
             offset = vehicle.queue_index * (CAR_LENGTH + CAR_SPACING) + CAR_LENGTH // 2 + 10
-            # Target queue position and road-edge spawn point
             if d == 'N':
-                tx, ty, angle = cx - LANE_WIDTH/2, cy - ROAD_WIDTH - offset, 0
-                sx, sy = tx, 0
+                return (cx - LANE_WIDTH/2, cy - ROAD_WIDTH - offset, 0)
             elif d == 'S':
-                tx, ty, angle = cx + LANE_WIDTH/2, cy + ROAD_WIDTH + offset, 180
-                sx, sy = tx, WINDOW_HEIGHT
+                return (cx + LANE_WIDTH/2, cy + ROAD_WIDTH + offset, 180)
             elif d == 'E':
-                tx, ty, angle = cx + ROAD_WIDTH + offset, cy - LANE_WIDTH/2, 270
-                sx, sy = WINDOW_WIDTH, ty
+                return (cx + ROAD_WIDTH + offset, cy - LANE_WIDTH/2, 270)
             else:  # W
-                tx, ty, angle = cx - ROAD_WIDTH - offset, cy + LANE_WIDTH/2, 90
-                sx, sy = 0, ty
-            # Slide in from the edge over APPROACH_ANIM_TIME sim seconds
-            elapsed = vehicle.env.now - vehicle.appear_time
-            if elapsed < APPROACH_ANIM_TIME:
-                t = elapsed / APPROACH_ANIM_TIME
-                return (sx + t * (tx - sx), sy + t * (ty - sy), angle)
-            return (tx, ty, angle)
+                return (cx - ROAD_WIDTH - offset, cy + LANE_WIDTH/2, 90)
         elif vehicle.state == 'crossing':
             p = vehicle.cross_progress
             start, pivot, end, a_start, a_end = self._crossing_path(d, vehicle.turn)
             if pivot is None:
-                # Straight — simple linear interpolation
+                # Straight crossing — heading stays constant
                 x = start[0] + p * (end[0] - start[0])
                 y = start[1] + p * (end[1] - start[1])
                 return (x, y, a_start)
-            elif p < 0.5:
-                # First half: entry point → pivot
-                t = p * 2
-                x = start[0] + t * (pivot[0] - start[0])
-                y = start[1] + t * (pivot[1] - start[1])
-                return (x, y, a_start)
+            # Quadratic Bezier curve: B(t) = (1-t)²·start + 2(1-t)t·pivot + t²·end
+            # Pivot is chosen so the curve is tangent to entry/exit lanes at endpoints,
+            # so the car only rotates inside the intersection.
+            t = p
+            omt = 1 - t
+            x = omt*omt*start[0] + 2*omt*t*pivot[0] + t*t*end[0]
+            y = omt*omt*start[1] + 2*omt*t*pivot[1] + t*t*end[1]
+            # Derivative of Bezier gives the instantaneous motion direction
+            mdx = 2*omt*(pivot[0]-start[0]) + 2*t*(end[0]-pivot[0])
+            mdy = 2*omt*(pivot[1]-start[1]) + 2*t*(end[1]-pivot[1])
+            if abs(mdx) < 1e-6 and abs(mdy) < 1e-6:
+                heading = a_start
             else:
-                # Second half: pivot → exit point (car has turned)
-                t = (p - 0.5) * 2
-                x = pivot[0] + t * (end[0] - pivot[0])
-                y = pivot[1] + t * (end[1] - pivot[1])
-                return (x, y, a_end)
+                heading = math.degrees(math.atan2(mdx, mdy)) % 360
+            return (x, y, heading)
+        elif vehicle.state == 'exiting':
+            return self.exit_position(vehicle)
         return None
+
+    def _spawn_xy(self, direction):
+        """Off-screen spawn point for a fresh vehicle, with initial heading."""
+        cx, cy = self.cx, self.cy
+        margin = CAR_LENGTH + 20
+        if direction == 'N':
+            return (cx - LANE_WIDTH/2, -margin, 0)
+        elif direction == 'S':
+            return (cx + LANE_WIDTH/2, WINDOW_HEIGHT + margin, 180)
+        elif direction == 'E':
+            return (WINDOW_WIDTH + margin, cy - LANE_WIDTH/2, 270)
+        else:  # W
+            return (-margin, cy + LANE_WIDTH/2, 90)
+
+    @staticmethod
+    def _approach_angle(current, target, max_step):
+        """Move `current` toward `target` (degrees) by at most max_step, shortest path."""
+        if current is None:
+            return target % 360
+        diff = (target - current + 180) % 360 - 180
+        if abs(diff) <= max_step:
+            return target % 360
+        return (current + (max_step if diff > 0 else -max_step)) % 360
+
+    def update_motion(self, intersection, dt):
+        """Per-frame physics: smoothly drive each vehicle toward its logical target,
+        while preventing rear-end collisions via car-following constraint.
+        """
+        if dt <= 0:
+            return
+        # Queued vehicles: front-to-back, each follows the one ahead.
+        # Front-of-queue follows the most-recently-departed same-direction car (if any).
+        for d in DIRECTIONS:
+            queue = intersection.queues[d]
+            recent_crossing = self._most_recent_same_direction(intersection, d)
+            for i, v in enumerate(queue):
+                lead = queue[i - 1] if i > 0 else recent_crossing
+                self._update_vehicle(v, dt, lead)
+        # Crossing & exiting: same-direction following too (DEPART_HEADWAY usually
+        # prevents close spacing, but defensive against turn paths converging)
+        for v in intersection.active_crossing:
+            lead = self._lead_in_motion(intersection, v)
+            self._update_vehicle(v, dt, lead)
+        for v in intersection.exiting:
+            self._update_vehicle(v, dt, None)
+
+    def _most_recent_same_direction(self, intersection, d):
+        """Most recently-departed car from direction d still visible in intersection."""
+        for v in reversed(intersection.active_crossing):
+            if v.direction == d:
+                return v
+        for v in reversed(intersection.exiting):
+            if v.direction == d:
+                return v
+        return None
+
+    def _lead_in_motion(self, intersection, vehicle):
+        """For a crossing vehicle, find a same-direction car ahead of it (higher cross_progress)."""
+        best = None
+        for v in intersection.active_crossing:
+            if v is vehicle or v.direction != vehicle.direction:
+                continue
+            if v.cross_progress > vehicle.cross_progress:
+                if best is None or v.cross_progress < best.cross_progress:
+                    best = v
+        return best
+
+    def _update_vehicle(self, v, dt, lead):
+        target = self.car_position(v)
+        if target is None:
+            return
+        tx, ty, t_heading = target
+
+        if v.disp_x is None:
+            sx, sy, s_heading = self._spawn_xy(v.direction)
+            v.disp_x, v.disp_y = sx, sy
+            v.disp_heading = s_heading
+
+        prev_x, prev_y = v.disp_x, v.disp_y
+
+        # Distance to logical target
+        dx = tx - v.disp_x
+        dy = ty - v.disp_y
+        dist_to_target = math.hypot(dx, dy)
+
+        # Car-following: limit advance so we don't pile into the car ahead
+        if lead is not None and lead.disp_x is not None:
+            dist_to_lead = math.hypot(lead.disp_x - v.disp_x, lead.disp_y - v.disp_y)
+            safe_gap = CAR_LENGTH + CAR_SPACING
+            advance_cap = max(0.0, dist_to_lead - safe_gap)
+            effective_dist = min(dist_to_target, advance_cap)
+        else:
+            effective_dist = dist_to_target
+
+        # Max cruise speed by state
+        if v.state == 'queued':
+            max_speed = CAR_QUEUE_MAX_SPEED
+        elif v.state == 'crossing':
+            max_speed = CAR_CROSS_MAX_SPEED
+        else:
+            max_speed = CAR_EXIT_MAX_SPEED
+        max_speed *= v.speed_factor
+
+        # Stopping-distance physics: v² = 2·a·d
+        stopping_speed = math.sqrt(2 * CAR_DECEL * effective_dist) if effective_dist > 0 else 0.0
+        target_speed = min(max_speed, stopping_speed)
+
+        old_vel = v.disp_vel
+        if v.disp_vel < target_speed:
+            v.disp_vel = min(target_speed, v.disp_vel + CAR_ACCEL * dt)
+            is_braking_now = False
+        else:
+            v.disp_vel = max(target_speed, v.disp_vel - CAR_DECEL * dt)
+            decel_rate = (old_vel - v.disp_vel) / max(dt, 1e-4)
+            is_braking_now = decel_rate > BRAKE_DECEL_THRESHOLD
+
+        # Move toward logical target, but capped by effective_dist (lead-following)
+        if dist_to_target > 0.1:
+            step = min(v.disp_vel * dt, effective_dist)
+            v.disp_x += (dx / dist_to_target) * step
+            v.disp_y += (dy / dist_to_target) * step
+        elif dist_to_target < 0.5:
+            v.disp_x, v.disp_y = tx, ty
+            v.disp_vel = 0.0
+
+        # Mark physical arrival at the queue slot — gates SimPy departure so the
+        # car only starts crossing once it is visually at the stop line.
+        if v.state == 'queued':
+            v.at_slot = dist_to_target < CAR_LENGTH * 0.6
+        else:
+            v.at_slot = True
+
+        # Heading: queued cars use direction-fixed heading (no fidgeting in queue);
+        # moving non-queued cars follow their actual motion direction, which gives
+        # natural rotation through Bezier turns.
+        if v.state == 'queued':
+            v.disp_heading = self._approach_angle(
+                v.disp_heading, t_heading, HEADING_TURN_RATE * dt)
+        else:
+            motion_dx = v.disp_x - prev_x
+            motion_dy = v.disp_y - prev_y
+            motion_dist = math.hypot(motion_dx, motion_dy)
+            if motion_dist > 0.4:
+                motion_heading = math.degrees(math.atan2(motion_dx, motion_dy)) % 360
+                v.disp_heading = self._approach_angle(
+                    v.disp_heading, motion_heading, HEADING_TURN_RATE * dt)
+            else:
+                v.disp_heading = self._approach_angle(
+                    v.disp_heading, t_heading, HEADING_TURN_RATE * dt)
+        # Brake lights: actively decelerating, OR queued and nearly stopped
+        v.braking = is_braking_now or (v.state == 'queued' and v.disp_vel < 4.0)
 
     def exit_position(self, vehicle):
         """Linear interpolation from exit stop-line to off-screen edge."""
@@ -635,44 +812,39 @@ class Renderer:
         p = vehicle.exit_progress
         return (s[0] + p * (e[0] - s[0]), s[1] + p * (e[1] - s[1]), angle)
 
-    def draw_car(self, x, y, angle, color):
-        # Build a rotated rectangle
-        if angle in (0, 180):
-            w, h = CAR_WIDTH, CAR_LENGTH
-        else:
-            w, h = CAR_LENGTH, CAR_WIDTH
-        rect = pygame.Rect(0, 0, w, h)
-        rect.center = (x, y)
-        pygame.draw.rect(self.screen, color, rect, border_radius=5)
-        pygame.draw.rect(self.screen, (20, 20, 20), rect, 1, border_radius=5)
-        # Windshield hint
-        if angle == 0:
-            pygame.draw.rect(self.screen, (100, 130, 160),
-                             (rect.x + 4, rect.y + 4, w - 8, 8))
-        elif angle == 180:
-            pygame.draw.rect(self.screen, (100, 130, 160),
-                             (rect.x + 4, rect.bottom - 12, w - 8, 8))
-        elif angle == 270:
-            pygame.draw.rect(self.screen, (100, 130, 160),
-                             (rect.x + 4, rect.y + 4, 8, h - 8))
-        elif angle == 90:
-            pygame.draw.rect(self.screen, (100, 130, 160),
-                             (rect.right - 12, rect.y + 4, 8, h - 8))
+    def draw_car(self, x, y, angle, color, braking=False):
+        """Render a car at (x, y) rotated to `angle` (our convention: 0=south,
+        90=east, 180=north, 270=west). Smooth rotation via pygame.transform.rotate.
+        """
+        # Build the car surface facing east (default surface orientation = our 90°)
+        surf = pygame.Surface((CAR_LENGTH, CAR_WIDTH), pygame.SRCALPHA)
+        body_rect = pygame.Rect(0, 0, CAR_LENGTH, CAR_WIDTH)
+        pygame.draw.rect(surf, color, body_rect, border_radius=5)
+        pygame.draw.rect(surf, (20, 20, 20), body_rect, 1, border_radius=5)
+        # Windshield at the front (right side of east-facing surface)
+        pygame.draw.rect(surf, (100, 130, 160),
+                         (CAR_LENGTH - 13, 4, 9, CAR_WIDTH - 8))
+        # Brake lights at the rear (left side); brighter when actively braking
+        bl_color = (255, 70, 70) if braking else (140, 35, 35)
+        pygame.draw.circle(surf, bl_color, (4, 6), 3)
+        pygame.draw.circle(surf, bl_color, (4, CAR_WIDTH - 6), 3)
+        # Rotate: pygame uses CCW-positive, surface default is east (our 90°)
+        # so the rotation needed is (our_angle - 90).
+        rotated = pygame.transform.rotate(surf, (angle or 0) - 90)
+        rect = rotated.get_rect(center=(x, y))
+        self.screen.blit(rotated, rect.topleft)
 
     def draw_vehicles(self, intersection):
+        def render(v):
+            if v.disp_x is not None:
+                self.draw_car(v.disp_x, v.disp_y, v.disp_heading, v.color, v.braking)
         for d in DIRECTIONS:
             for v in intersection.queues[d]:
-                pos = self.car_position(v)
-                if pos:
-                    self.draw_car(pos[0], pos[1], pos[2], v.color)
+                render(v)
         for v in intersection.active_crossing:
-            pos = self.car_position(v)
-            if pos:
-                self.draw_car(pos[0], pos[1], pos[2], v.color)
+            render(v)
         for v in intersection.exiting:
-            pos = self.exit_position(v)
-            if pos:
-                self.draw_car(pos[0], pos[1], pos[2], v.color)
+            render(v)
 
     def draw_panel(self, sim_state):
         """Right-side info panel."""
@@ -1227,6 +1399,11 @@ class App:
                 self.sim_target += dt * self.speed
                 while self.env.peek() <= self.sim_target:
                     self.env.step()
+
+            # Physics: smoothly drive each vehicle toward its logical target.
+            # sim_dt is 0 when paused/not started, so motion freezes naturally.
+            sim_dt = dt * self.speed if (self.started and not self.paused) else 0
+            self.renderer.update_motion(self.intersection, sim_dt)
 
             stats = self.intersection.stats()
             # Sample history every simulated second
