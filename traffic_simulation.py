@@ -91,6 +91,9 @@ CAR_EXIT_MAX_SPEED     = 180.0   # max speed leaving the intersection
 HEADING_TURN_RATE      = 320.0   # deg/sec — max rotation speed
 BRAKE_DECEL_THRESHOLD  = 45.0    # px/sec² braking magnitude → brake lights on
 SPEED_VARIANCE         = 0.18    # ±18% per-car speed factor (driver variance)
+CONFLICT_RADIUS        = 130.0   # px — a car starts yielding to a higher-priority
+                                 # car this close ahead (covers crossing-path
+                                 # conflicts, e.g. opposing left turns at centre)
 
 # Scenarios: arrival rate per direction (vehicles/sec)
 SCENARIOS = {
@@ -108,6 +111,14 @@ SCENARIOS = {
 DIRECTIONS = ['N', 'S', 'E', 'W']
 NS_DIRECTIONS = ['N', 'S']
 EW_DIRECTIONS = ['E', 'W']
+OPPOSING = {'N': 'S', 'S': 'N', 'E': 'W', 'W': 'E'}
+
+# Permissive left turn: a left-turner pulls to the centre of the intersection
+# and yields there to oncoming through traffic and to any opposing left that
+# has right-of-way, then completes the turn — often finishing on the yellow /
+# all-red clearance, exactly like a real green-ball (unprotected) left.
+LEFT_YIELD_PROGRESS = 0.45   # cross_progress where the car pauses (just shy of centre)
+LEFT_CLEAR_PROGRESS = 0.65   # an oncoming straight car past this has cleared the conflict
 
 # Pedestrian parameters
 CROSSWALK_WIDTH = 14          # px — stripe band width
@@ -155,6 +166,16 @@ _EXIT_ANGLES = {
     ('S', 'straight'): 180, ('S', 'right'): 90,  ('S', 'left'): 270,
     ('E', 'straight'): 270, ('E', 'right'): 180, ('E', 'left'): 0,
     ('W', 'straight'): 90,  ('W', 'right'): 0,   ('W', 'left'): 180,
+}
+
+# Physical exit lane each (approach, turn) feeds. Three movements share every
+# lane, so e.g. a South-left and a North-right both merge into the westbound
+# lane — a left-turner must yield to ANY opposing car sharing its exit lane.
+_EXIT_LANE = {
+    ('N', 'straight'): 'SB', ('E', 'left'):  'SB', ('W', 'right'): 'SB',
+    ('S', 'straight'): 'NB', ('E', 'right'): 'NB', ('W', 'left'):  'NB',
+    ('N', 'right'):    'WB', ('S', 'left'):  'WB', ('E', 'straight'): 'WB',
+    ('N', 'left'):     'EB', ('S', 'right'): 'EB', ('W', 'straight'): 'EB',
 }
 
 
@@ -356,12 +377,31 @@ class Vehicle:
             v.queue_index = i
         self.intersection.active_crossing.append(self)
 
-        # Animate through intersection box
+        # Animate through the intersection box. Left-turners are PERMISSIVE:
+        # they advance to the centre, hold there until oncoming through traffic
+        # and any prior opposing left have cleared, then complete the turn.
         start = self.env.now
-        while self.env.now - start < CROSS_TIME:
-            self.cross_progress = (self.env.now - start) / CROSS_TIME
-            yield self.env.timeout(0.05)
-        self.cross_progress = 1.0
+        if self.turn == 'left':
+            hold_until = CROSS_TIME * LEFT_YIELD_PROGRESS
+            while self.env.now - start < hold_until:
+                self.cross_progress = (self.env.now - start) / CROSS_TIME
+                yield self.env.timeout(0.05)
+            self.cross_progress = LEFT_YIELD_PROGRESS
+            # Yield at the centre until the conflicting path is clear
+            while not self.intersection.left_turn_clear(self):
+                yield self.env.timeout(0.1)
+            resume = self.env.now
+            remaining = CROSS_TIME * (1.0 - LEFT_YIELD_PROGRESS)
+            while self.env.now - resume < remaining:
+                self.cross_progress = (LEFT_YIELD_PROGRESS
+                                       + (self.env.now - resume) / CROSS_TIME)
+                yield self.env.timeout(0.05)
+            self.cross_progress = 1.0
+        else:
+            while self.env.now - start < CROSS_TIME:
+                self.cross_progress = (self.env.now - start) / CROSS_TIME
+                yield self.env.timeout(0.05)
+            self.cross_progress = 1.0
 
         # Intersection cleared — record for stats and release blocking slot
         self.finish_time = self.env.now
@@ -447,6 +487,33 @@ class Intersection:
         while True:
             yield self.env.timeout(random.expovariate(PED_ARRIVAL_RATE))
             Pedestrian(self.env, crosswalk, self)
+
+    def left_turn_clear(self, car):
+        """Whether a permissive left-turner waiting at the centre may now
+        complete its turn. It must yield to oncoming through traffic and to
+        any opposing left that has right-of-way. Opposing lefts are ordered
+        strictly by (start_cross_time, id), so two of them can never wait on
+        each other — the resolution is deadlock-free.
+        """
+        opp = OPPOSING[car.direction]
+        car_key = (car.start_cross_time, car.id)
+        car_lane = _EXIT_LANE[(car.direction, car.turn)]
+        for v in self.active_crossing:
+            if v is car or v.direction != opp:
+                continue
+            if v.turn == 'left':
+                # opposing left — crossing conflict, strict priority order
+                if (v.start_cross_time, v.id) < car_key and v.cross_progress < 1.0:
+                    return False
+            elif v.turn == 'straight':
+                # oncoming through — crossing conflict
+                if v.cross_progress < LEFT_CLEAR_PROGRESS:
+                    return False
+            else:  # opposing right — conflicts only if it merges into our lane
+                if (_EXIT_LANE[(v.direction, v.turn)] == car_lane
+                        and v.cross_progress < LEFT_CLEAR_PROGRESS):
+                    return False
+        return True
 
     def stats(self):
         n_completed = len(self.completed)
@@ -690,13 +757,17 @@ class Renderer:
             for i, v in enumerate(queue):
                 lead = queue[i - 1] if i > 0 else recent_crossing
                 self._update_vehicle(v, dt, lead)
-        # Crossing & exiting: same-direction following too (DEPART_HEADWAY usually
-        # prevents close spacing, but defensive against turn paths converging)
-        for v in intersection.active_crossing:
-            lead = self._lead_in_motion(intersection, v)
-            self._update_vehicle(v, dt, lead)
-        for v in intersection.exiting:
-            self._update_vehicle(v, dt, None)
+        # Crossing & exiting: every car yields to the nearest HIGHER-priority
+        # car ahead of it within its travel cone — regardless of approach, turn,
+        # or whether their paths merge or simply cross. Priority is a strict
+        # total order (exiting outranks crossing; then progress; then id), so a
+        # car only ever brakes for cars ahead of it and the most-advanced car in
+        # any conflict never yields — the conflict always clears (no deadlock).
+        # This covers rear-end conflicts, lane merges, AND crossing paths such
+        # as opposing left turns meeting at the intersection centre.
+        in_motion = list(intersection.active_crossing) + list(intersection.exiting)
+        for v in in_motion:
+            self._update_vehicle(v, dt, self._blocking_lead(v, in_motion))
 
     def _most_recent_same_direction(self, intersection, d):
         """Most recently-departed car from direction d still visible in intersection."""
@@ -708,15 +779,59 @@ class Renderer:
                 return v
         return None
 
-    def _lead_in_motion(self, intersection, vehicle):
-        """For a crossing vehicle, find a same-direction car ahead of it (higher cross_progress)."""
-        best = None
-        for v in intersection.active_crossing:
-            if v is vehicle or v.direction != vehicle.direction:
+    @staticmethod
+    def _priority(v):
+        """Right-of-way key — larger goes first, everyone else yields to it.
+        Order: exiting (leaving, ahead of all) > crossing straight/right >
+        crossing left. Putting permissive left turns lowest keeps the renderer
+        consistent with the model's left-yield (a straight/right car never
+        brakes for a left-turner). Within a band the more-advanced car leads;
+        id breaks ties — a strict total order, so resolution is deadlock-free.
+        """
+        if v.state == 'exiting':
+            base = 3.0 + v.exit_progress          # 3..4  — already leaving
+        elif v.turn == 'left':
+            base = v.cross_progress               # 0..1  — permissive: yields to all
+        else:
+            base = 1.0 + v.cross_progress         # 1..2  — straight/right
+        return (base, v.id)
+
+    def _blocking_lead(self, v, in_motion):
+        """Nearest car ahead of v (inside its ~45° forward cone, within
+        CONFLICT_RADIUS) that v must slow for. None if the path is clear.
+
+        A car ahead blocks v when EITHER it shares v's destination exit lane
+        (a rear-end or a merge — you always follow whoever is in front in your
+        lane, regardless of turn type) OR it has higher right-of-way priority
+        (a crossing-path conflict). The forward-cone test makes "ahead" a
+        strictly one-directional relation, so two cars can never mutually
+        yield — conflict resolution stays deadlock-free.
+        """
+        if v.disp_x is None:
+            return None
+        vp = self._priority(v)
+        v_lane = _EXIT_LANE[(v.direction, v.turn)]
+        # Forward unit vector for v's heading (0=S, 90=E, 180=N, 270=W).
+        a = math.radians(v.disp_heading if v.disp_heading is not None else 0.0)
+        fx, fy = math.sin(a), math.cos(a)
+        best, best_d = None, CONFLICT_RADIUS
+        for u in in_motion:
+            if u is v or u.disp_x is None:
                 continue
-            if v.cross_progress > vehicle.cross_progress:
-                if best is None or v.cross_progress < best.cross_progress:
-                    best = v
+            same_lane = _EXIT_LANE[(u.direction, u.turn)] == v_lane
+            # Not in our lane and lower/equal priority → no conflict for v.
+            if not same_lane and self._priority(u) <= vp:
+                continue
+            wx, wy = u.disp_x - v.disp_x, u.disp_y - v.disp_y
+            d = math.hypot(wx, wy)
+            if d >= best_d:
+                continue
+            forward = fx * wx + fy * wy           # component ahead of v
+            lateral = abs(-fy * wx + fx * wy)     # component beside v
+            # Keep only cars within a ~45° cone ahead — rejects beside/behind.
+            if forward <= 0.0 or forward < lateral:
+                continue
+            best, best_d = u, d
         return best
 
     def _update_vehicle(self, v, dt, lead):

@@ -13,6 +13,8 @@ This simulation models a four-way intersection controlled by traffic lights. Veh
 
 The goal is to measure how different traffic light control strategies affect driver wait times, queue buildup, and overall intersection throughput across three traffic scenarios.
 
+The model also includes **pedestrians** crossing at the four crosswalks and **turning vehicles** (cars may go straight, turn left, or turn right). Vehicles are rendered with realistic motion — smooth acceleration and braking, brake lights, gradual turning, and slight per-driver speed variation — so the visualization reflects natural traffic flow. This motion realism is purely visual; the wait-time and throughput statistics are driven by the underlying SimPy discrete-event model, not the animation.
+
 ---
 
 ## 2. Statistics Explained
@@ -122,6 +124,24 @@ A **low Avg Wait with a very high Max Wait** is a warning sign: most cars move q
 
 ---
 
+### 2.7 Pedestrians (Waiting & Crossing)
+
+**What it is:** The **PEDESTRIANS** section of the panel shows two live counts — how many pedestrians are currently *waiting* at a crosswalk for a safe signal, and how many are currently *crossing*.
+
+**How it is calculated:**
+- **Waiting** — pedestrians who have arrived at a crosswalk but cannot cross yet because vehicles facing that crosswalk still have a green or yellow light.
+- **Crossing** — pedestrians who are currently walking across the intersection (each crossing takes 4 simulation seconds).
+
+**When pedestrians may cross:** A pedestrian only steps off when the vehicles that would hit their crosswalk are stopped. Pedestrians at the **North/South crosswalks** cross while the East–West direction has the green (i.e. during EW green, yellow, or the all-red buffer), and vice versa. This mirrors how real signalized intersections give pedestrians a walk interval against stopped traffic.
+
+**Color coding in the panel:**
+- Waiting — white normally, **red** when more than 4 pedestrians are backed up at the crosswalks
+- Crossing — **green** while at least one pedestrian is in the intersection, white when none
+
+**What it tells you:** A persistently high Waiting count indicates the signal cycle is leaving pedestrians stranded — a fairness signal that complements the vehicle-side queue stats.
+
+---
+
 ## 3. Queue Statistics (Per Direction)
 
 The **Queues** section of the panel shows the current number of vehicles waiting at each of the four approaches individually.
@@ -184,9 +204,64 @@ The traffic light starts with a shorter green phase (8 seconds minimum) and exte
 
 Arrival times follow an **exponential distribution** (Poisson process), which reflects the random, memoryless nature of real vehicle arrivals.
 
+Pedestrians arrive independently at each of the four crosswalks, also as a Poisson process (a low arrival rate of roughly one pedestrian every ~17 seconds per crosswalk), so foot traffic stays light relative to vehicle traffic.
+
 ---
 
-## 6. Results & Analysis Screen
+## 6. Vehicle & Pedestrian Behavior
+
+### 6.1 Turning Movements
+
+Every vehicle is randomly assigned a movement when it spawns:
+
+| Movement | Probability |
+|----------|-------------|
+| Straight (through) | 50% |
+| Left turn | 25% |
+| Right turn | 25% |
+
+The chosen movement determines which exit road the car takes after clearing the intersection. Turning is shown visually as the car gradually rotates onto its new heading rather than snapping instantly.
+
+### 6.2 Permissive Left Turns
+
+The signal runs as a standard real-world **two-phase** controller: North and South go green together, then East and West go green together. Opposing *through* movements share a green because they do not conflict — this pairing is exactly how the majority of real signalised intersections operate, and the Adaptive mode simply lengthens or shortens these same two phases based on demand.
+
+Left turns are modelled as **permissive** (a green *ball*, not a protected green *arrow*) — the same as a typical unprotected left in real life. A left-turning car:
+
+1. Enters the intersection on its green and pulls forward to the **centre**.
+2. **Holds at the centre** and yields until there is a safe gap.
+3. Completes the turn once clear — frequently finishing during the **yellow / all-red clearance** after oncoming traffic has stopped, just as real drivers do.
+
+A waiting left-turner yields to:
+
+| Conflict | Rule |
+|----------|------|
+| **Oncoming through traffic** (opposite approach going straight) | Wait until it has cleared the centre |
+| **The opposing left turn** | Strict first-come order — whichever entered the intersection first goes first (so two opposing lefts can never deadlock) |
+| **Any opposing car merging into the same exit lane** | e.g. a South-left and a North-right both feed the **westbound** lane — the car behind follows rather than overlapping |
+
+Through and right-turning cars are **never** blocked by a left-turner — consistent with reality, the permissive left yields, not the other way around. The right-of-way ordering is strict, so conflict resolution is **deadlock-free**: every conflict always clears.
+
+> **Effect on statistics:** The centre-hold delays a left-turner's time *inside* the intersection only. It does **not** change **Avg Wait**, which is measured from arrival until the car leaves the queue (see §2.4). The extra delay instead appears as slightly lower **Rolling Throughput** and **Efficiency** when there are many left turns (most visible in Rush Hour) — the realistic cost of unprotected left turns. A *protected* left-turn phase would reduce this but lengthen the overall cycle.
+
+### 6.3 Departure Headway
+
+Cars do not all surge forward the instant the light turns green. A minimum **departure headway of 2 seconds** is enforced between consecutive vehicles leaving the *same* approach. This models real driver reaction time and following distance, and it caps how many cars a single green phase can realistically discharge — an important factor when interpreting Throughput.
+
+### 6.4 Realistic Motion (Visualization)
+
+The rendered cars use simple physics so the animation looks natural:
+
+- **Acceleration / braking** — cars speed up smoothly and brake when approaching a queue or a red light.
+- **Brake lights** — illuminate when a car decelerates hard.
+- **Speed variance** — each car has a slightly different preferred speed (±18%), so drivers are not identical.
+- **Smooth turning** — heading changes are rotated over time, not instant.
+
+> **Important:** This motion is cosmetic. Wait time, throughput, and efficiency are computed from the SimPy event model (arrival, start-cross, and finish timestamps), so the statistics remain exact regardless of the on-screen animation. The one place animation and model meet is the departure rule: a car will not begin crossing until its sprite has actually reached the stop line.
+
+---
+
+## 7. Results & Analysis Screen
 
 Press **A** during the simulation to open the Results & Analysis screen. It contains four panels:
 
@@ -216,9 +291,11 @@ A comparison table showing four metrics side by side for each scenario:
 
 The **Δ (Delta)** column shows the difference (Adaptive − Fixed). The **Winner** column highlights which mode performed better for that metric.
 
+> **Note on which Throughput is shown:** The live side panel and the Top-Right chart use the **rolling 60-second** Throughput (recent performance, see §2.3). The two comparison panels above — the bar chart and this summary table — instead use the **cumulative lifetime average** (total vehicles ÷ total sim time × 60). This is intentional: cross-scenario comparisons are fairer using a stable lifetime figure than a fluctuating rolling one.
+
 ---
 
-## 7. How to Read the Results Together
+## 8. How to Read the Results Together
 
 When analyzing simulation output, consider these patterns:
 
