@@ -354,8 +354,8 @@ reported as **mean ± half-width**. Interpretation: *"we are 95% confident the t
 
 Two timestamped CSVs are written to the output folder (and saved incrementally, so a long run can be safely interrupted with Ctrl+C and keep whatever finished):
 
-- **`batch_summary_<timestamp>.csv`** — one row per scenario/mode, with `mean`, `stdev`, and `ci95_halfwidth` for each metric. This is the table to put in the report.
-- **`batch_replications_<timestamp>.csv`** — one row per individual run (`scenario, mode, replication, avg_wait, max_wait, throughput, efficiency, completed`). This is the raw evidence for an appendix; `completed` is the number of vehicles counted in the steady-state window.
+- **`batch_summary_<timestamp>.csv`** — one row per scenario/mode. This is the table to put in the report. It has **14 columns**: `scenario`, `mode`, then a three-column block — `<Metric> mean`, `<Metric> stdev`, `<Metric> ci95_halfwidth` — repeated for each of the four metrics (Avg Wait, Max Wait, Throughput, Efficiency), e.g. `Avg Wait (s) mean`, `Avg Wait (s) stdev`, `Avg Wait (s) ci95_halfwidth`. To read a row: the `adaptive` / `Normal Traffic` row reports average wait as `Avg Wait (s) mean` ± `Avg Wait (s) ci95_halfwidth`. If that interval does not overlap the corresponding `fixed` row, the difference between the two control modes is statistically significant (§9.5).
+- **`batch_replications_<timestamp>.csv`** — one row per individual run; **8 columns**: `scenario, mode, replication, avg_wait, max_wait, throughput, efficiency, completed`. This is the raw evidence for an appendix; `completed` is the number of vehicles counted in the steady-state window. The summary file's `mean`/`stdev`/`ci95_halfwidth` are computed from these rows.
 
 Metrics use the definitions in §2. Note **Avg Wait** is still queue wait (start-cross − arrival, §2.4); throughput here is the steady-state rate over `[warmup, duration]`.
 
